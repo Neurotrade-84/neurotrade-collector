@@ -1,0 +1,44 @@
+# Save this as /etc/systemd/system/neurotrade-collector.service on the VPS.
+# Runs collect_orderbook.py continuously and restarts it automatically if it
+# ever crashes or the VPS reboots.
+#
+# IMPORTANT - folder structure matters: collect_orderbook.py computes its output
+# path as "one level above its own folder" (this matched the full NeuroTrade
+# project's app/ layout). Keep that same layout in this small repo too:
+#   neurotrade-collector/
+#     app/
+#       collect_orderbook.py
+#     requirements.txt
+#     neurotrade-collector.service
+#
+# Setup on a fresh Ubuntu/Debian VPS:
+#   1. sudo apt update && sudo apt install -y python3 python3-pip git
+#   2. git clone <your-github-repo-url> /opt/neurotrade-collector
+#   3. cd /opt/neurotrade-collector && pip3 install -r requirements.txt
+#   4. sudo cp neurotrade-collector.service /etc/systemd/system/
+#   5. sudo systemctl daemon-reload
+#   6. sudo systemctl enable neurotrade-collector   (auto-start on boot)
+#   7. sudo systemctl start neurotrade-collector
+#
+# Data lands in: /opt/neurotrade-collector/data_cache/orderbook/binance/
+#
+# Check status / logs:
+#   sudo systemctl status neurotrade-collector
+#   journalctl -u neurotrade-collector -f          (live log, like watching the CMD window)
+
+[Unit]
+Description=NeuroTrade Binance order book + trade flow collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/neurotrade-collector
+ExecStart=/usr/bin/python3 /opt/neurotrade-collector/app/collect_orderbook.py --provider binance --assets BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT --interval 60
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
