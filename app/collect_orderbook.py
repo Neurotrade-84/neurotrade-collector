@@ -31,6 +31,25 @@ geo-restricted, could behave differently than from Iran). Test with a short
 `--interval 10` run from the VPS before committing to a long collection run there.
 Binance's public market-data endpoints (depth/trades) are unauthenticated and
 generally reliable from EU IPs, including Frankfurt.
+
+---
+Fix log (2026-08-18):
+- spread_pct was stored as a raw fraction (never multiplied by 100) AND rounded to
+  only 6 decimal places. For BTC/ETH tick sizes that fraction is ~1.6e-7, which
+  rounds to exactly 0.0 at 6 decimals almost every single poll - the field was
+  silently dead across ~19,900 real collected rows. Fixed: multiply by 100, round to
+  8 decimals instead of 6.
+- last_trade_price was always None for provider=binance, because Binance's /depth
+  endpoint (unlike Nobitex's orderbook endpoint) doesn't return a last-trade price.
+  The data wasn't lost - it was sitting in the trades CSV's last_price column the
+  whole time - but the orderbook row never picked it up. Fixed: for binance, the
+  trade summary is now fetched BEFORE the orderbook row is written, and its
+  last_price is copied into the orderbook row.
+- imbalance was silently near-depth-only (bid_volume_l1/ask_volume_l1 were stored
+  but never used in any imbalance figure). Not a bug, but easy to mistake for a bug
+  since the field name doesn't say "near". Added a second field, imbalance_l1,
+  computed the same way but from the L1 volumes, so both signals are preserved
+  instead of only keeping one and losing the other permanently.
 """
 import sys
 import os
@@ -83,6 +102,9 @@ def fetch_orderbook(provider: str, symbol: str) -> dict:
                                 params={"symbol": symbol, "limit": 100})
         bids = [(float(p), float(a)) for p, a in data.get("bids", [])]
         asks = [(float(p), float(a)) for p, a in data.get("asks", [])]
+        # Binance's /depth response has no last-trade price. Left as None here on
+        # purpose - for provider=binance, main() fills this in from the trades
+        # summary before the row is written (see below).
         last_trade_price = None
     else:
         raise ValueError(f"Unknown provider: {provider}")
@@ -97,28 +119,35 @@ def summarize_orderbook(ob: dict) -> dict:
     best_bid = max(p for p, a in bids)
     best_ask = min(p for p, a in asks)
     mid = (best_bid + best_ask) / 2
-    spread_pct = (best_ask - best_bid) / mid if mid else float("nan")
+    # Expressed as a percentage (matches the field name) - a raw fraction here is
+    # ~1e-7 for BTC/ETH tick sizes and rounds to 0.0 at low decimal precision.
+    spread_pct = (best_ask - best_bid) / mid * 100 if mid else float("nan")
 
     bid_l1_amount = max(bids, key=lambda x: x[0])[1]
     ask_l1_amount = min(asks, key=lambda x: x[0])[1]
+    l1_total = bid_l1_amount + ask_l1_amount
+    imbalance_l1 = (bid_l1_amount - ask_l1_amount) / l1_total if l1_total > 0 else 0.0
 
     near_lo, near_hi = mid * (1 - NEAR_PCT), mid * (1 + NEAR_PCT)
     bid_vol_near = sum(a for p, a in bids if p >= near_lo)
     ask_vol_near = sum(a for p, a in asks if p <= near_hi)
-    total = bid_vol_near + ask_vol_near
-    imbalance = (bid_vol_near - ask_vol_near) / total if total > 0 else 0.0
+    near_total = bid_vol_near + ask_vol_near
+    imbalance = (bid_vol_near - ask_vol_near) / near_total if near_total > 0 else 0.0
 
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "best_bid": best_bid,
         "best_ask": best_ask,
         "mid_price": round(mid, 8),
-        "spread_pct": round(spread_pct, 6),
+        # Raw fraction rounded to 6dp used to silently collapse to 0.0 for BTC/ETH -
+        # now a percentage rounded to 8dp so real variance survives.
+        "spread_pct": round(spread_pct, 8),
         "bid_volume_l1": round(bid_l1_amount, 6),
         "ask_volume_l1": round(ask_l1_amount, 6),
         "bid_volume_near": round(bid_vol_near, 6),
         "ask_volume_near": round(ask_vol_near, 6),
-        "imbalance": round(imbalance, 6),
+        "imbalance": round(imbalance, 6),          # near-depth imbalance (unchanged)
+        "imbalance_l1": round(imbalance_l1, 6),    # new: top-of-book-only imbalance
         "last_trade_price": ob.get("last_trade_price"),
     }
 
@@ -150,7 +179,7 @@ def summarize_trades(trades: list) -> dict:
         return {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "trade_count": 0, "buy_volume": 0.0, "sell_volume": 0.0,
-            "trade_imbalance": 0.0, "vwap": None,
+            "trade_imbalance": 0.0, "vwap": None, "last_price": None,
         }
     buy_vol = sum(t["amount"] for t in trades if t["aggressor_side"] == "buy")
     sell_vol = sum(t["amount"] for t in trades if t["aggressor_side"] == "sell")
@@ -182,7 +211,7 @@ def append_row(csv_path: Path, row: dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", default="binance", choices=["nobitex", "binance"])
+    parser.add_argument("--provider", default="nobitex", choices=["nobitex", "binance"])
     parser.add_argument("--assets", default="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT")
     parser.add_argument("--interval", type=int, default=60,
                          help="seconds between polls, per asset (default 60)")
@@ -206,22 +235,31 @@ def main():
         for asset in assets:
             try:
                 ob = fetch_orderbook(args.provider, asset)
-                ob_row = summarize_orderbook(ob)
-                append_row(provider_dir / f"{asset}_orderbook.csv", ob_row)
 
                 if args.provider == "binance":
+                    # Fetch trades FIRST so last_trade_price can be filled into the
+                    # orderbook row before it's written (previously always None here).
                     trades = fetch_trades(args.provider, asset)
                     tr_row = summarize_trades(trades)
+                    ob["last_trade_price"] = tr_row.get("last_price")
+
+                    ob_row = summarize_orderbook(ob)
+                    append_row(provider_dir / f"{asset}_orderbook.csv", ob_row)
                     append_row(provider_dir / f"{asset}_trades.csv", tr_row)
 
                     poll_count += 1
                     print(f"[{ob_row['timestamp_utc']}] {asset}: mid={ob_row['mid_price']} "
+                          f"spread_pct={ob_row['spread_pct']:.6f} "
                           f"book_imbalance={ob_row['imbalance']:+.3f} "
                           f"trade_imbalance={tr_row['trade_imbalance']:+.3f} "
                           f"({tr_row['trade_count']} trades) ({poll_count} snapshots so far)")
                 else:
+                    ob_row = summarize_orderbook(ob)
+                    append_row(provider_dir / f"{asset}_orderbook.csv", ob_row)
+
                     poll_count += 1
                     print(f"[{ob_row['timestamp_utc']}] {asset}: mid={ob_row['mid_price']} "
+                          f"spread_pct={ob_row['spread_pct']:.6f} "
                           f"book_imbalance={ob_row['imbalance']:+.3f} "
                           f"({poll_count} snapshots so far)")
             except Exception as e:
