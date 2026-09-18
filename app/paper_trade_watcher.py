@@ -49,13 +49,24 @@ def load_new_rows(ob_path, tr_path, last_seen_ts):
     ob["timestamp_utc"] = pd.to_datetime(ob["timestamp_utc"], utc=True)
     tr["timestamp_utc"] = pd.to_datetime(tr["timestamp_utc"], utc=True)
 
-    df = pd.concat([
-        ob[["timestamp_utc", "mid_price", "last_trade_price"]].reset_index(drop=True),
-        tr[["last_price"]].reset_index(drop=True),
-    ], axis=1)
-    # trade_to_quote uses last_trade_price from the orderbook row (already filled
-    # from trades by the collect_orderbook.py fix) - fall back to trades' last_price
-    # if that's ever missing, for robustness.
+    # Merge by TIMESTAMP (nearest match within a tight tolerance), not by row
+    # position. The two CSVs are written by two separate append_row() calls in
+    # collect_orderbook.py - if either write is ever delayed or fails on one
+    # side (a transient network hiccup, a race between this watcher reading
+    # mid-write), the two files can end up with different row counts. Concat by
+    # position then silently misaligns EVERY row after that point forever,
+    # pairing each mid_price with the wrong last_trade_price - this was
+    # confirmed as the actual cause of the live/backtest discrepancy (44,395
+    # orderbook rows vs 44,396 trades rows on 2026-09-18).
+    ob_sorted = ob.sort_values("timestamp_utc")
+    tr_sorted = tr[["timestamp_utc", "last_price"]].sort_values("timestamp_utc")
+    df = pd.merge_asof(
+        ob_sorted[["timestamp_utc", "mid_price", "last_trade_price"]],
+        tr_sorted,
+        on="timestamp_utc",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=5),
+    )
     df["last_trade_price"] = df["last_trade_price"].fillna(df["last_price"])
     df["trade_to_quote"] = (df["last_trade_price"] - df["mid_price"]) / df["mid_price"]
 
