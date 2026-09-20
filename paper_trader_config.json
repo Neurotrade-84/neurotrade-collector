@@ -1,0 +1,7 @@
+{
+  "hi_threshold": 0.000102,
+  "trend_threshold": 0.012156,
+  "hold_snapshots": 15,
+  "cost": 0.0010,
+  "poll_seconds": 30
+}
