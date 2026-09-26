@@ -4,8 +4,7 @@ Real-time PAPER-TRADING watcher for the trade_to_quote signal.
 This is NOT a live-money trading bot. It reads the same CSV files that
 collect_orderbook.py is already writing (it does not place any real orders,
 does not need API keys, does not touch the exchange at all) and simulates
-LONG-ONLY entries using thresholds that were fixed from OLD data - it never
-re-fits thresholds on new data, to keep this a genuine forward test.
+LONG-ONLY entries.
 
 Why long-only: the Sep 2026 out-of-sample check found the short side failed
 (hit rate 38.5%, avg -0.21%) while longs held up (hit rate 60.0%, avg +0.62%)
@@ -26,8 +25,22 @@ NOT included: a retrospective spread_pct comparison looked equally strong
 filter - a textbook retrospective-correlation-vs-predictive-filter trap. Don't
 add a spread filter here without re-running this same forward-test discipline.
 
-Rule (frozen, do not tune on live data - only re-derive from a NEW completed
-calibration window and document the change):
+ADAPTIVE THRESHOLDS (added 2026-09-26): thresholds fixed once from an August
+calibration window silently stopped firing after BTC rose ~30% (64k -> 84k) -
+zero trades for 6 straight days, discovered only by noticing the output file
+had stopped growing. Root cause: trade_to_quote's effective resolution is set
+by the exchange's fixed dollar tick size, which shrinks as a PERCENTAGE when
+price rises - so a percentile-based threshold frozen at one price level
+gradually becomes unreachable as price moves away from that level, even though
+trade_to_quote is nominally "already a percentage." Thresholds are now
+recalculated periodically (default: every `recalib_every_rows` new snapshots,
+default 500 ~= 8-9 hours) from a trailing window of recent data (default
+`recalib_window_rows` = 3000 ~= 2 days) - not fit-and-tested on the same data,
+since every trade uses thresholds computed strictly before it. Set
+"adaptive": false in the config file to pin fixed thresholds again (e.g. for a
+deliberate one-off historical replay).
+
+Rule:
     signal   = LONG when trade_to_quote >= HI_THRESHOLD
                AND trade_imbalance_roll_5m > TREND_THRESHOLD
     hold     = 15 snapshots (~15 minutes at the current ~62s poll interval)
@@ -39,17 +52,17 @@ Logs every simulated trade (entry time/price, exit time/price, net return) to
 paper_trades_<asset>.csv, appending forever - safe to stop/restart, it resumes
 from where it left off using the last logged timestamp.
 
-Config file (recommended, added 2026-09-20): instead of hardcoding thresholds in
-the systemd ExecStart line (which meant regenerating the whole unit file for
-every experiment), pass --config pointing at a small JSON file. CLI args still
-work and override the config file, for one-off manual runs.
+Config file (recommended - lets you change settings by editing one small file
+and restarting, instead of regenerating the whole systemd unit each time):
 
     config.json:
-        {"hi_threshold": 0.000102, "trend_threshold": 0.012156,
+        {"adaptive": true, "hi_percentile": 0.99, "trend_percentile": 0.50,
+         "recalib_window_rows": 3000, "recalib_every_rows": 500,
+         "hi_threshold": 0.000102, "trend_threshold": 0.012156,
          "hold_snapshots": 15, "cost": 0.0010, "poll_seconds": 30}
 
-    python3 paper_trade_watcher.py --orderbook ... --trades ... --out ... \
-        --config config.json
+    (hi_threshold/trend_threshold above are only used as the very first seed,
+    before the first recalibration, and as the fixed values when adaptive=false)
 
 Usage (run per asset, ideally under systemd like the collector itself):
     python3 paper_trade_watcher.py \
@@ -68,6 +81,22 @@ from datetime import datetime, timezone
 import pandas as pd
 
 
+def _compute_features(ob: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
+    ob_sorted = ob.sort_values("timestamp_utc")
+    tr_sorted = tr[["timestamp_utc", "last_price", "trade_imbalance"]].sort_values("timestamp_utc")
+    df = pd.merge_asof(
+        ob_sorted[["timestamp_utc", "mid_price", "last_trade_price"]],
+        tr_sorted,
+        on="timestamp_utc",
+        direction="nearest",
+        tolerance=pd.Timedelta(seconds=5),
+    )
+    df["last_trade_price"] = df["last_trade_price"].fillna(df["last_price"])
+    df["trade_to_quote"] = (df["last_trade_price"] - df["mid_price"]) / df["mid_price"]
+    df["trade_imbalance_roll_5m"] = df["trade_imbalance"].rolling(5).mean()
+    return df
+
+
 def load_new_rows(ob_path, tr_path, last_seen_ts):
     ob = pd.read_csv(ob_path)
     tr = pd.read_csv(tr_path)
@@ -83,25 +112,32 @@ def load_new_rows(ob_path, tr_path, last_seen_ts):
     # pairing each mid_price with the wrong last_trade_price - this was
     # confirmed as the actual cause of the live/backtest discrepancy (44,395
     # orderbook rows vs 44,396 trades rows on 2026-09-18).
-    ob_sorted = ob.sort_values("timestamp_utc")
-    tr_sorted = tr[["timestamp_utc", "last_price", "trade_imbalance"]].sort_values("timestamp_utc")
-    df = pd.merge_asof(
-        ob_sorted[["timestamp_utc", "mid_price", "last_trade_price"]],
-        tr_sorted,
-        on="timestamp_utc",
-        direction="nearest",
-        tolerance=pd.Timedelta(seconds=5),
-    )
-    df["last_trade_price"] = df["last_trade_price"].fillna(df["last_price"])
-    df["trade_to_quote"] = (df["last_trade_price"] - df["mid_price"]) / df["mid_price"]
-    # Rolling mean computed on the FULL merged history (not just the new-rows
-    # slice below) so the window has proper context right after a restart,
-    # instead of being empty/short for the first few polls.
-    df["trade_imbalance_roll_5m"] = df["trade_imbalance"].rolling(5).mean()
+    df = _compute_features(ob, tr)
 
     if last_seen_ts is not None:
         df = df[df["timestamp_utc"] > last_seen_ts]
     return df.reset_index(drop=True)
+
+
+def compute_adaptive_thresholds(ob_path, tr_path, window_rows: int,
+                                 hi_percentile: float, trend_percentile: float,
+                                 up_to_ts=None):
+    """Recomputes thresholds from a trailing window of recent history. Only uses
+    data up to (and including) `up_to_ts` if given, so a recalibration triggered
+    mid-poll never peeks at rows the live loop hasn't processed yet."""
+    ob = pd.read_csv(ob_path)
+    tr = pd.read_csv(tr_path)
+    ob["timestamp_utc"] = pd.to_datetime(ob["timestamp_utc"], utc=True)
+    tr["timestamp_utc"] = pd.to_datetime(tr["timestamp_utc"], utc=True)
+    df = _compute_features(ob, tr)
+    if up_to_ts is not None:
+        df = df[df["timestamp_utc"] <= up_to_ts]
+    window = df.tail(window_rows).dropna(subset=["trade_to_quote", "trade_imbalance_roll_5m"])
+    if len(window) < 100:
+        return None  # not enough data yet - caller keeps the previous thresholds
+    hi = window["trade_to_quote"].quantile(hi_percentile)
+    trend = window["trade_imbalance_roll_5m"].quantile(trend_percentile)
+    return float(hi), float(trend)
 
 
 def append_trade_log(out_path: Path, row: dict):
@@ -131,15 +167,13 @@ def main():
     p.add_argument("--trades", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--config", default=None,
-                    help="path to a JSON file with hi_threshold/trend_threshold/hold_snapshots/"
-                         "cost/poll_seconds - lets you change thresholds by editing one small file "
-                         "and restarting, instead of regenerating the whole systemd unit each time. "
-                         "CLI flags below override whatever the config file says.")
+                    help="path to a JSON file with settings - lets you change behavior by editing "
+                         "one small file and restarting, instead of regenerating the whole systemd "
+                         "unit each time. CLI flags below override whatever the config file says.")
     p.add_argument("--hi-threshold", type=float, default=None,
-                    help="fixed long-entry threshold for trade_to_quote, derived from an OLD calibration window - do not refit live")
+                    help="seed/fixed long-entry threshold for trade_to_quote (see --config for adaptive mode)")
     p.add_argument("--trend-threshold", type=float, default=None,
-                    help="fixed minimum for trade_imbalance_roll_5m (sustained buy pressure) - "
-                         "second, independently-required condition alongside hi-threshold")
+                    help="seed/fixed minimum for trade_imbalance_roll_5m")
     p.add_argument("--hold-snapshots", type=int, default=None)
     p.add_argument("--cost", type=float, default=None,
                     help="round-trip cost as a fraction, default 0.10%% (Binance Regular User taker)")
@@ -147,10 +181,12 @@ def main():
     args = p.parse_args()
 
     # Config file provides defaults; any CLI flag actually passed overrides it.
-    # Hardcoded fallbacks match the values validated so far, so a bare run with
-    # neither --config nor the individual flags still does something sane.
-    cfg = {"hi_threshold": 0.000102, "trend_threshold": 0.012156,
-           "hold_snapshots": 15, "cost": 0.0010, "poll_seconds": 30}
+    cfg = {
+        "adaptive": True, "hi_percentile": 0.99, "trend_percentile": 0.50,
+        "recalib_window_rows": 3000, "recalib_every_rows": 500,
+        "hi_threshold": 0.000102, "trend_threshold": 0.012156,
+        "hold_snapshots": 15, "cost": 0.0010, "poll_seconds": 30,
+    }
     if args.config:
         cfg.update(json.loads(Path(args.config).read_text()))
     for key in ["hi_threshold", "trend_threshold", "hold_snapshots", "cost", "poll_seconds"]:
@@ -161,16 +197,23 @@ def main():
     out_path = Path(args.out)
     last_ts = get_last_logged_timestamp(out_path)
     print(f"Resuming paper trading watcher. Last logged entry: {last_ts}")
-    print(f"Rule: LONG when trade_to_quote >= {cfg['hi_threshold']} "
-          f"AND trade_imbalance_roll_5m > {cfg['trend_threshold']}, "
+    mode_desc = f"ADAPTIVE (recalibrates every {cfg['recalib_every_rows']} rows)" if cfg["adaptive"] else "FIXED"
+    print(f"Mode: {mode_desc}")
+
+    if cfg["adaptive"]:
+        recalibrated = compute_adaptive_thresholds(
+            args.orderbook, args.trades, cfg["recalib_window_rows"],
+            cfg["hi_percentile"], cfg["trend_percentile"], up_to_ts=last_ts)
+        if recalibrated:
+            cfg["hi_threshold"], cfg["trend_threshold"] = recalibrated
+
+    print(f"Rule: LONG when trade_to_quote >= {cfg['hi_threshold']:.6f} "
+          f"AND trade_imbalance_roll_5m > {cfg['trend_threshold']:.6f}, "
           f"hold {cfg['hold_snapshots']} snapshots, cost {cfg['cost']:.3%}")
 
-    open_position = None  # {"entry_time","entry_price","entry_idx_marker"}
-    pending_close_after = None
-
-    # Track how many NEW snapshots we've seen since a position was opened, since
-    # this script polls a growing file rather than a live tick stream.
+    open_position = None  # {"entry_time","entry_price"}
     seen_since_open = 0
+    rows_since_recalib = 0
 
     while True:
         try:
@@ -182,6 +225,19 @@ def main():
 
         for _, row in new_rows.iterrows():
             last_ts = row["timestamp_utc"]
+            rows_since_recalib += 1
+
+            if cfg["adaptive"] and rows_since_recalib >= cfg["recalib_every_rows"]:
+                recalibrated = compute_adaptive_thresholds(
+                    args.orderbook, args.trades, cfg["recalib_window_rows"],
+                    cfg["hi_percentile"], cfg["trend_percentile"], up_to_ts=last_ts)
+                if recalibrated:
+                    old_hi, old_trend = cfg["hi_threshold"], cfg["trend_threshold"]
+                    cfg["hi_threshold"], cfg["trend_threshold"] = recalibrated
+                    print(f"[{last_ts}] RECALIBRATED: hi_threshold {old_hi:.6f} -> "
+                          f"{cfg['hi_threshold']:.6f}, trend_threshold {old_trend:.6f} -> "
+                          f"{cfg['trend_threshold']:.6f}")
+                rows_since_recalib = 0
 
             if open_position is None:
                 if row["trade_to_quote"] >= cfg["hi_threshold"] and \
