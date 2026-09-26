@@ -1,5 +1,10 @@
 {
-  "hi_threshold": 0.000102,
+  "adaptive": true,
+  "hi_percentile": 0.99,
+  "trend_percentile": 0.50,
+  "recalib_window_rows": 3000,
+  "recalib_every_rows": 500,
+  "hi_threshold": 0.000073,
   "trend_threshold": 0.012156,
   "hold_snapshots": 15,
   "cost": 0.0010,
