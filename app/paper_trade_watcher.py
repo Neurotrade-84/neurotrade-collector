@@ -93,7 +93,18 @@ def _compute_features(ob: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
     )
     df["last_trade_price"] = df["last_trade_price"].fillna(df["last_price"])
     df["trade_to_quote"] = (df["last_trade_price"] - df["mid_price"]) / df["mid_price"]
-    df["trade_imbalance_roll_5m"] = df["trade_imbalance"].rolling(5).mean()
+    # WORKAROUND (found 2026-09-29): on this server's pandas 3.0.5 (a very new
+    # version, forced by a numpy/CPU compatibility issue - see collect_orderbook.py
+    # notes), calling .rolling() directly on a column pulled out of a
+    # merge_asof() result returns 100% NaN, even after reset_index(drop=True) -
+    # confirmed by direct testing on the live server data. Rebuilding a brand
+    # new Series from the raw numpy values before rolling sidesteps whatever
+    # internal state merge_asof leaves behind. This cost 3 days of silently
+    # empty trend_threshold checks (Sep 26-29) before being caught - watch for
+    # this same pattern (a rolling/window operation on a post-merge column
+    # returning all-NaN) if pandas is ever upgraded/downgraded on this server.
+    trade_imbalance_fresh = pd.Series(df["trade_imbalance"].to_numpy(dtype="float64"))
+    df["trade_imbalance_roll_5m"] = trade_imbalance_fresh.rolling(5).mean().to_numpy()
     return df
 
 
