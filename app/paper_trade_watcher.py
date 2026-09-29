@@ -1,3 +1,4 @@
+import numpy as np
 """
 Real-time PAPER-TRADING watcher for the trade_to_quote signal.
 
@@ -103,8 +104,14 @@ def _compute_features(ob: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
     # empty trend_threshold checks (Sep 26-29) before being caught - watch for
     # this same pattern (a rolling/window operation on a post-merge column
     # returning all-NaN) if pandas is ever upgraded/downgraded on this server.
-    trade_imbalance_fresh = pd.Series(df["trade_imbalance"].to_numpy(dtype="float64"))
-    df["trade_imbalance_roll_5m"] = trade_imbalance_fresh.rolling(5).mean().to_numpy()
+    trade_imbalance_fresh = df["trade_imbalance"].to_numpy(dtype="float64")
+    trade_imbalance_roll_5m = np.full(len(trade_imbalance_fresh), np.nan, dtype="float64")
+    trade_imbalance_roll_5m[4:] = np.convolve(
+        trade_imbalance_fresh,
+        np.ones(5, dtype="float64") / 5.0,
+        mode="valid",
+    )
+    df["trade_imbalance_roll_5m"] = trade_imbalance_roll_5m
     return df
 
 
