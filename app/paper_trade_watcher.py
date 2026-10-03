@@ -1,4 +1,3 @@
-import numpy as np
 """
 Real-time PAPER-TRADING watcher for the trade_to_quote signal.
 
@@ -104,14 +103,8 @@ def _compute_features(ob: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
     # empty trend_threshold checks (Sep 26-29) before being caught - watch for
     # this same pattern (a rolling/window operation on a post-merge column
     # returning all-NaN) if pandas is ever upgraded/downgraded on this server.
-    trade_imbalance_fresh = df["trade_imbalance"].to_numpy(dtype="float64")
-    trade_imbalance_roll_5m = np.full(len(trade_imbalance_fresh), np.nan, dtype="float64")
-    trade_imbalance_roll_5m[4:] = np.convolve(
-        trade_imbalance_fresh,
-        np.ones(5, dtype="float64") / 5.0,
-        mode="valid",
-    )
-    df["trade_imbalance_roll_5m"] = trade_imbalance_roll_5m
+    trade_imbalance_fresh = pd.Series(df["trade_imbalance"].to_numpy(dtype="float64"))
+    df["trade_imbalance_roll_5m"] = trade_imbalance_fresh.rolling(5).mean().to_numpy()
     return df
 
 
@@ -140,9 +133,26 @@ def load_new_rows(ob_path, tr_path, last_seen_ts):
 def compute_adaptive_thresholds(ob_path, tr_path, window_rows: int,
                                  hi_percentile: float, trend_percentile: float,
                                  up_to_ts=None):
-    """Recomputes thresholds from a trailing window of recent history. Only uses
-    data up to (and including) `up_to_ts` if given, so a recalibration triggered
-    mid-poll never peeks at rows the live loop hasn't processed yet."""
+    """Recomputes ONLY hi_threshold (trade_to_quote) from a trailing window of
+    recent history - trend_threshold is NOT adapted here (see main() - it stays
+    pinned to its configured fixed value). Only uses data up to (and including)
+    `up_to_ts` if given, so a recalibration triggered mid-poll never peeks at
+    rows the live loop hasn't processed yet.
+
+    WHY trend_threshold isn't adapted (found 2026-10-03): trade_to_quote's
+    resolution is tied to the exchange's absolute dollar tick size, which
+    shrinks as a percentage when price rises - a real, price-scale-driven
+    reason to recalibrate it periodically. trade_imbalance has no such
+    dependency; it's already a bounded, scale-free ratio (-1 to 1). Adapting
+    its threshold via a rolling 50th-percentile (median) instead introduced a
+    NEW bug: trade_imbalance's median drifts with net buy/sell pressure and
+    went NEGATIVE for extended periods (e.g. -0.070 on 2026-09-29), which
+    inverted the filter's whole purpose - "require sustained BUY pressure"
+    became "accept anything above a sometimes-negative number", defeating the
+    filter exactly while live results were quietly getting worse (25% hit
+    rate over the 20 trades logged during this period, vs ~60% in the
+    original historical forward-test). Keep trend_threshold fixed unless a
+    new, deliberately re-validated adaptive scheme for it is designed."""
     ob = pd.read_csv(ob_path)
     tr = pd.read_csv(tr_path)
     ob["timestamp_utc"] = pd.to_datetime(ob["timestamp_utc"], utc=True)
@@ -150,12 +160,11 @@ def compute_adaptive_thresholds(ob_path, tr_path, window_rows: int,
     df = _compute_features(ob, tr)
     if up_to_ts is not None:
         df = df[df["timestamp_utc"] <= up_to_ts]
-    window = df.tail(window_rows).dropna(subset=["trade_to_quote", "trade_imbalance_roll_5m"])
+    window = df.tail(window_rows).dropna(subset=["trade_to_quote"])
     if len(window) < 100:
-        return None  # not enough data yet - caller keeps the previous thresholds
+        return None  # not enough data yet - caller keeps the previous threshold
     hi = window["trade_to_quote"].quantile(hi_percentile)
-    trend = window["trade_imbalance_roll_5m"].quantile(trend_percentile)
-    return float(hi), float(trend)
+    return float(hi)
 
 
 def append_trade_log(out_path: Path, row: dict):
@@ -219,11 +228,14 @@ def main():
     print(f"Mode: {mode_desc}")
 
     if cfg["adaptive"]:
-        recalibrated = compute_adaptive_thresholds(
+        new_hi = compute_adaptive_thresholds(
             args.orderbook, args.trades, cfg["recalib_window_rows"],
             cfg["hi_percentile"], cfg["trend_percentile"], up_to_ts=last_ts)
-        if recalibrated:
-            cfg["hi_threshold"], cfg["trend_threshold"] = recalibrated
+        if new_hi is not None:
+            cfg["hi_threshold"] = new_hi
+    # trend_threshold is intentionally NEVER adaptive - see compute_adaptive_thresholds()
+    # docstring for why (2026-10-03: adapting it via a rolling median caused it to
+    # go negative, silently inverting the filter's meaning).
 
     print(f"Rule: LONG when trade_to_quote >= {cfg['hi_threshold']:.6f} "
           f"AND trade_imbalance_roll_5m > {cfg['trend_threshold']:.6f}, "
@@ -246,15 +258,15 @@ def main():
             rows_since_recalib += 1
 
             if cfg["adaptive"] and rows_since_recalib >= cfg["recalib_every_rows"]:
-                recalibrated = compute_adaptive_thresholds(
+                new_hi = compute_adaptive_thresholds(
                     args.orderbook, args.trades, cfg["recalib_window_rows"],
                     cfg["hi_percentile"], cfg["trend_percentile"], up_to_ts=last_ts)
-                if recalibrated:
-                    old_hi, old_trend = cfg["hi_threshold"], cfg["trend_threshold"]
-                    cfg["hi_threshold"], cfg["trend_threshold"] = recalibrated
+                if new_hi is not None:
+                    old_hi = cfg["hi_threshold"]
+                    cfg["hi_threshold"] = new_hi
                     print(f"[{last_ts}] RECALIBRATED: hi_threshold {old_hi:.6f} -> "
-                          f"{cfg['hi_threshold']:.6f}, trend_threshold {old_trend:.6f} -> "
-                          f"{cfg['trend_threshold']:.6f}")
+                          f"{cfg['hi_threshold']:.6f} (trend_threshold stays fixed at "
+                          f"{cfg['trend_threshold']:.6f})")
                 rows_since_recalib = 0
 
             if open_position is None:
